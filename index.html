@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>The Same Day, Again — a looping stick-figure short</title>
+<style>
+  :root { --bg:#0c0e15; --panel:#141824; --ink:#c9d1e0; --muted:#6a748c; --accent:#5b6b8c; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font-family:"Segoe UI",system-ui,-apple-system,sans-serif; }
+  .wrap { min-height:100%; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:18px; padding:24px; }
+  h1 { font-size:18px; font-weight:600; letter-spacing:.5px; margin:0; color:var(--ink); }
+  p.sub { margin:0; color:var(--muted); font-size:13px; }
+  .stage { position:relative; width:min(96vw,960px); aspect-ratio:16/9;
+    border-radius:12px; overflow:hidden; box-shadow:0 24px 60px rgba(0,0,0,.55);
+    border:1px solid #232a3a; background:#000; }
+  canvas { width:100%; height:100%; display:block; }
+  .label { position:absolute; left:14px; bottom:12px; font-size:12px; letter-spacing:2px;
+    text-transform:uppercase; color:rgba(201,209,224,.55); pointer-events:none; }
+  .bar { position:absolute; left:0; bottom:0; height:3px; background:var(--accent);
+    width:0%; transition:width .06s linear; opacity:.7; }
+  .controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center; justify-content:center; }
+  button { background:var(--panel); color:var(--ink); border:1px solid #29314a;
+    padding:9px 16px; border-radius:8px; font-size:13px; cursor:pointer; transition:.15s; }
+  button:hover { background:#1c2233; border-color:#3a445f; }
+  button:disabled { opacity:.5; cursor:default; }
+  .status { color:var(--muted); font-size:12px; min-height:16px; }
+  a.dl { display:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div style="text-align:center">
+    <h1>The Same Day, Again</h1>
+    <p class="sub">A ~18-second loop of someone who does not love their job. Generated entirely in JavaScript.</p>
+  </div>
+  <div class="stage">
+    <canvas id="c" width="960" height="540"></canvas>
+    <div class="label" id="scenelabel"></div>
+    <div class="bar" id="bar"></div>
+  </div>
+  <div class="controls">
+    <button id="play">Pause</button>
+    <button id="restart">Restart loop</button>
+    <button id="rec">● Export video (.webm)</button>
+  </div>
+  <div class="status" id="status">Tip: the video loops perfectly — end frame flows straight back into the first.</div>
+  <a class="dl" id="dl"></a>
+</div>
+<script>
+"use strict";
+/* ============================================================================
+   THE SAME DAY, AGAIN
+   A melancholy stick-figure loop, drawn frame-by-frame on a 2D canvas.
+   The whole animation is a pure function of a single time value t in [0, DUR),
+   so it loops seamlessly by construction. Every scene fades from and to black,
+   which means the wrap-around boundary (t=DUR -> t=0) is black->black too.
+============================================================================ */
+
+const cv  = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const W = cv.width, H = cv.height;
+const FPS = 30;
+const TWO_PI = Math.PI * 2;
+
+/* ---- tiny math helpers ---- */
+const rad    = d => d * Math.PI / 180;
+const lerp   = (a, b, t) => a + (b - a) * t;
+const clamp  = (v, a, b) => Math.max(a, Math.min(b, v));
+const smooth = t => t * t * (3 - 2 * t);
+const ease   = t => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+const mix    = (p1, p2, t) => { const o = {}; for (const k in p1) o[k] = lerp(p1[k], p2[k], t); return o; };
+
+/* ---- palette ---- */
+const LINE = '#d7deec';                 // stick-figure line/skin colour
+const OUT = {
+  pajama: { torso:'#54637f', sleeves:'#54637f', pants:'#48546c', armW:11, legW:12, tie:null,     collar:false, bare:false },
+  suit:   { torso:'#2a2f3d', sleeves:'#2a2f3d', pants:'#23272f', armW:11, legW:12, tie:'#8b4a4a', collar:true,  bare:false },
+  bare:   { torso:null,      sleeves:LINE,      pants:LINE,      armW:4,  legW:4,  tie:null,      collar:false, bare:true  },
+  home:   { torso:'#4f4a63', sleeves:'#4f4a63', pants:'#413c54', armW:12, legW:12, tie:null,      collar:false, bare:false },
+};
+
+/* ---- skeleton proportions (local coords, hip at 0,0) ---- */
+const TORSO=58, NECK=13, HEADR=15, UARM=30, FARM=27, THIGH=34, SHIN=33, SHW=11, HIPW=9;
+
+const BASE = {
+  lean:0, headTilt:0,
+  LuA:rad(-10), LfA:rad(-9),  RuA:rad(10),  RfA:rad(9),
+  LuL:rad(-8),  LlL:rad(-7),  RuL:rad(8),   RlL:rad(7),
+};
+
+/* ============================================================================
+   FIGURE
+============================================================================ */
+function limb(x, y, a1, l1, a2, l2, col, w) {
+  const j1x = x + Math.sin(a1) * l1, j1y = y + Math.cos(a1) * l1;
+  const j2x = j1x + Math.sin(a2) * l2, j2y = j1y + Math.cos(a2) * l2;
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.strokeStyle = col; ctx.lineWidth = w;
+  ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(j1x, j1y); ctx.lineTo(j2x, j2y); ctx.stroke();
+  return { j1:[j1x, j1y], j2:[j2x, j2y] };
+}
+
+// Draws an upright figure with the hip at the local origin.
+// Caller sets up translate / rotate / scale beforehand. Returns joint points.
+function drawFigure(pose, outfit, faceMood, opt) {
+  opt = opt || {};
+  const lean = pose.lean, ht = pose.headTilt;
+  const nx = Math.sin(lean) * TORSO,           ny = -Math.cos(lean) * TORSO;               // neck
+  const hx = nx + Math.sin(lean + ht) * (NECK + HEADR), hy = ny - Math.cos(lean + ht) * (NECK + HEADR); // head
+  const lsh = [nx - SHW, ny], rsh = [nx + SHW, ny];
+  const lhip = [-HIPW, 0], rhip = [HIPW, 0];
+
+  // legs (behind torso)
+  const legCol = outfit.bare ? outfit.pants : outfit.pants;
+  const ll = limb(lhip[0], lhip[1], pose.LuL, THIGH, pose.LlL, SHIN, legCol, outfit.legW);
+  const rl = limb(rhip[0], rhip[1], pose.RuL, THIGH, pose.RlL, SHIN, legCol, outfit.legW);
+  // feet
+  ctx.fillStyle = LINE;
+  for (const f of [ll.j2, rl.j2]) { ctx.beginPath(); ctx.ellipse(f[0], f[1], 5, 3, 0, 0, TWO_PI); ctx.fill(); }
+
+  // torso garment
+  if (outfit.torso) {
+    ctx.fillStyle = outfit.torso;
+    ctx.beginPath();
+    ctx.moveTo(lsh[0] - 2, lsh[1]);
+    ctx.lineTo(rsh[0] + 2, rsh[1]);
+    ctx.lineTo(rhip[0] + 4, rhip[1] + 4);
+    ctx.lineTo(lhip[0] - 4, lhip[1] + 4);
+    ctx.closePath(); ctx.fill();
+    if (outfit.collar) { // shirt V
+      ctx.strokeStyle = '#c8ccd6'; ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.moveTo(nx - 6, ny + 1); ctx.lineTo(nx, ny + 14); ctx.lineTo(nx + 6, ny + 1); ctx.stroke();
+    }
+    if (outfit.tie) {
+      ctx.fillStyle = outfit.tie;
+      ctx.beginPath();
+      ctx.moveTo(nx - 3, ny + 4); ctx.lineTo(nx + 3, ny + 4);
+      ctx.lineTo(nx + 5, ny + TORSO * 0.55); ctx.lineTo(nx, ny + TORSO * 0.62);
+      ctx.lineTo(nx - 5, ny + TORSO * 0.55);
+      ctx.closePath(); ctx.fill();
+    }
+  } else {
+    // bare torso: a spine line so the figure reads
+    ctx.strokeStyle = LINE; ctx.lineWidth = 4; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(nx, ny); ctx.stroke();
+    if (opt.towel) { ctx.fillStyle = '#6b7385'; ctx.fillRect(-14, -4, 28, 16); }
+  }
+
+  // arms
+  const la = limb(lsh[0], lsh[1], pose.LuA, UARM, pose.LfA, FARM, outfit.sleeves, outfit.armW);
+  const ra = limb(rsh[0], rsh[1], pose.RuA, UARM, pose.RfA, FARM, outfit.sleeves, outfit.armW);
+  // hands
+  ctx.fillStyle = LINE;
+  for (const hnd of [la.j2, ra.j2]) { ctx.beginPath(); ctx.arc(hnd[0], hnd[1], 3.6, 0, TWO_PI); ctx.fill(); }
+
+  // neck
+  ctx.strokeStyle = LINE; ctx.lineWidth = 3; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(nx, ny); ctx.lineTo(hx, hy + HEADR); ctx.stroke();
+
+  // head
+  ctx.beginPath(); ctx.arc(hx, hy, HEADR, 0, TWO_PI);
+  ctx.fillStyle = '#20263a'; ctx.fill();
+  ctx.strokeStyle = LINE; ctx.lineWidth = 3; ctx.stroke();
+
+  drawFace(hx, hy, HEADR, faceMood, opt.tear || 0, opt.blink || 0, lean + ht);
+
+  return { lhand: la.j2, rhand: ra.j2, lfoot: ll.j2, rfoot: rl.j2, neck:[nx, ny], head:[hx, hy] };
+}
+
+function drawFace(hx, hy, r, mood, tear, blink, rot) {
+  ctx.save();
+  ctx.translate(hx, hy); ctx.rotate(rot || 0);
+  ctx.strokeStyle = LINE; ctx.fillStyle = LINE; ctx.lineWidth = 2.1; ctx.lineCap = 'round';
+  const ex = r * 0.40, ey = -r * 0.08;
+
+  const closed = mood === 'sleep' || blink > 0.5;
+  if (closed) {
+    for (const sx of [-1, 1]) { ctx.beginPath(); ctx.moveTo(sx * ex - 4, ey); ctx.lineTo(sx * ex + 4, ey); ctx.stroke(); }
+  } else if (mood === 'groggy' || mood === 'tired') {
+    for (const sx of [-1, 1]) { ctx.beginPath(); ctx.arc(sx * ex, ey, 4, Math.PI * 0.15, Math.PI * 0.85); ctx.stroke(); }
+  } else { // sad: small dots
+    for (const sx of [-1, 1]) { ctx.beginPath(); ctx.arc(sx * ex, ey, 2.2, 0, TWO_PI); ctx.fill(); }
+  }
+
+  // sad / worried eyebrows
+  if (mood === 'sad' || mood === 'tired') {
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(-ex - 5, ey - 8); ctx.lineTo(-ex + 4, ey - 4); ctx.stroke();   // inner higher
+    ctx.beginPath(); ctx.moveTo( ex + 5, ey - 8); ctx.lineTo( ex - 4, ey - 4); ctx.stroke();
+  }
+
+  // mouth
+  ctx.lineWidth = 2.1;
+  if (mood === 'sleep') {
+    ctx.beginPath(); ctx.ellipse(0, r * 0.5, 3.2, 2.4, 0, 0, TWO_PI); ctx.stroke();
+  } else { // downturned frown (arc opening upward)
+    ctx.beginPath(); ctx.arc(0, r * 0.72, r * 0.30, Math.PI * 1.22, Math.PI * 1.78); ctx.stroke();
+  }
+
+  if (tear > 0) {
+    ctx.fillStyle = 'rgba(143,183,232,' + clamp(tear, 0, 1) + ')';
+    const ty = ey + 6 + tear * 14;
+    ctx.beginPath(); ctx.ellipse(-ex, ty, 2.4, 3.4, 0, 0, TWO_PI); ctx.fill();
+  }
+  ctx.restore();
+}
+
+/* ---- small props / effects ---- */
+function drawZ(x, y, secs) {
+  ctx.fillStyle = 'rgba(215,222,236,0.7)';
+  ctx.textAlign = 'center';
+  for (let i = 0; i < 3; i++) {
+    const p = (secs * 0.6 + i * 0.34) % 1;
+    ctx.globalAlpha = 0.7 * (1 - p);
+    ctx.font = (12 + i * 6) + "px Segoe UI";
+    ctx.fillText('z', x + i * 14 + p * 10, y - p * 34);
+  }
+  ctx.globalAlpha = 1;
+}
+function sweat(x, y, secs) {
+  const p = (secs * 0.9) % 1;
+  ctx.fillStyle = 'rgba(150,190,235,' + (0.8 * (1 - p)) + ')';
+  ctx.beginPath(); ctx.ellipse(x, y + p * 20, 2.5, 3.6, 0, 0, TWO_PI); ctx.fill();
+}
+function honk(x, y, secs) {
+  const pulse = 0.5 + 0.5 * Math.sin(secs * 9);
+  ctx.globalAlpha = 0.35 + 0.5 * pulse;
+  ctx.fillStyle = '#e8d27a'; ctx.textAlign = 'center';
+  ctx.font = "bold 20px Segoe UI"; ctx.fillText('HONK!', x, y);
+  ctx.globalAlpha = 1;
+}
+
+/* ---- ambient dark overlay (for dim rooms) ---- */
+function dim(amount) { ctx.fillStyle = 'rgba(6,8,14,' + clamp(amount, 0, 1) + ')'; ctx.fillRect(0, 0, W, H); }
+
+/* ---- vignette + faint grain for mood ---- */
+function vignette() {
+  const g = ctx.createRadialGradient(W / 2, H / 2, H * 0.35, W / 2, H / 2, H * 0.95);
+  g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,0.45)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+}
+
+/* ============================================================================
+   BACKGROUNDS
+============================================================================ */
+function room(wall, floor, floorY) {
+  ctx.fillStyle = wall;  ctx.fillRect(0, 0, W, floorY);
+  ctx.fillStyle = floor; ctx.fillRect(0, floorY, W, H - floorY);
+}
+function window2(x, y, w, h, night) {
+  ctx.fillStyle = night ? '#10203a' : '#3a5a86';
+  ctx.fillRect(x, y, w, h);
+  if (night) { ctx.fillStyle = '#cdd6ea';
+    for (let i = 0; i < 7; i++) ctx.fillRect(x + 12 + (i * 53 % (w - 20)), y + 14 + (i * 37 % (h - 20)), 2, 2);
+    ctx.fillStyle = '#e9edf5'; ctx.beginPath(); ctx.arc(x + w - 26, y + 24, 9, 0, TWO_PI); ctx.fill();
+  }
+  ctx.strokeStyle = '#1b2233'; ctx.lineWidth = 5; ctx.strokeRect(x, y, w, h);
+  ctx.beginPath(); ctx.moveTo(x + w / 2, y); ctx.lineTo(x + w / 2, y + h);
+  ctx.moveTo(x, y + h / 2); ctx.lineTo(x + w, y + h / 2); ctx.stroke();
+}
+function bed(x, y) {
+  ctx.fillStyle = '#3a4358'; ctx.fillRect(x, y, 300, 60);           // mattress
+  ctx.fillStyle = '#2c3346'; ctx.fillRect(x, y + 40, 300, 34);      // base
+  ctx.fillStyle = '#59657f'; ctx.fillRect(x + 200, y - 8, 100, 40); // blanket lump
+  ctx.fillStyle = '#e6e9f1'; ctx.fillRect(x + 8, y - 4, 70, 26);    // pillow
+  ctx.fillStyle = '#232a3a'; ctx.fillRect(x - 10, y - 60, 16, 130); // headboard
+}
+
+function bedroom(light) {
+  const day = clamp(light, 0, 1);
+  room('#2b3346', '#232a3a', 420);
+  window2(620, 90, 190, 150, day < 0.5);
+  bed(150, 350);
+  // nightstand
+  ctx.fillStyle = '#39415a'; ctx.fillRect(470, 360, 70, 60);
+  dim((1 - day) * 0.45);
+}
+
+function alarmClock(x, y, ringing, secs) {
+  const shake = ringing ? Math.sin(secs * 40) * 2 : 0;
+  ctx.save(); ctx.translate(x + shake, y);
+  ctx.fillStyle = '#c25b5b'; ctx.fillRect(-16, -14, 32, 24);
+  ctx.fillStyle = '#e6e9f1'; ctx.beginPath(); ctx.arc(0, -2, 9, 0, TWO_PI); ctx.fill();
+  ctx.strokeStyle = '#222'; ctx.lineWidth = 1.6;
+  const a = secs * 3; ctx.beginPath(); ctx.moveTo(0, -2); ctx.lineTo(Math.sin(a) * 5, -2 - Math.cos(a) * 5); ctx.stroke();
+  ctx.fillStyle = '#c25b5b'; ctx.beginPath(); ctx.arc(-9, -16, 5, 0, TWO_PI); ctx.arc(9, -16, 5, 0, TWO_PI); ctx.fill();
+  if (ringing) {
+    ctx.strokeStyle = 'rgba(230,210,120,' + (0.5 + 0.5 * Math.sin(secs * 20)) + ')'; ctx.lineWidth = 2;
+    for (const s of [-1, 1]) { ctx.beginPath(); ctx.arc(s * 26, -6, 8, 0, Math.PI * 1.4); ctx.stroke(); }
+  }
+  ctx.restore();
+}
+
+function bathroom() {
+  room('#2c3a3f', '#212b2e', 420);
+  // mirror
+  ctx.fillStyle = '#3d5158'; ctx.fillRect(120, 90, 150, 150);
+  ctx.strokeStyle = '#1b2427'; ctx.lineWidth = 6; ctx.strokeRect(120, 90, 150, 150);
+  ctx.fillStyle = 'rgba(255,255,255,0.06)'; ctx.beginPath();
+  ctx.moveTo(140, 100); ctx.lineTo(200, 100); ctx.lineTo(150, 230); ctx.lineTo(126, 230); ctx.closePath(); ctx.fill();
+  // sink
+  ctx.fillStyle = '#cfd6de'; ctx.fillRect(110, 300, 170, 22);
+  ctx.beginPath(); ctx.ellipse(195, 314, 55, 14, 0, 0, TWO_PI); ctx.fill();
+  ctx.fillStyle = '#8a929c'; ctx.fillRect(150, 260, 6, 44); // faucet
+  ctx.fillRect(150, 260, 30, 6);
+  dim(0.28);
+}
+function faucetDrops(secs) {
+  for (let i = 0; i < 3; i++) {
+    const p = (secs * 1.4 + i * 0.33) % 1;
+    ctx.fillStyle = 'rgba(150,190,235,' + (0.6 * (1 - p)) + ')';
+    ctx.beginPath(); ctx.ellipse(180, 268 + p * 44, 1.8, 3, 0, 0, TWO_PI); ctx.fill();
+  }
+}
+
+function wardrobe() {
+  room('#33303f', '#262231', 420);
+  // closet
+  ctx.fillStyle = '#413a52'; ctx.fillRect(110, 110, 150, 260);
+  ctx.strokeStyle = '#241f30'; ctx.lineWidth = 4; ctx.strokeRect(110, 110, 150, 260);
+  ctx.beginPath(); ctx.moveTo(185, 110); ctx.lineTo(185, 370); ctx.stroke();
+  ctx.fillStyle = '#8a929c'; ctx.fillRect(178, 230, 4, 20); ctx.fillRect(188, 230, 4, 20);
+  // hanging clothes
+  const cols = ['#4a5468', '#5a4a4a', '#3a4358'];
+  for (let i = 0; i < 3; i++) { ctx.fillStyle = cols[i]; ctx.fillRect(126 + i * 12, 130, 10, 70); }
+  // full-length mirror on right
+  ctx.fillStyle = '#3d4658'; ctx.fillRect(760, 130, 70, 260);
+  ctx.strokeStyle = '#20263a'; ctx.lineWidth = 5; ctx.strokeRect(760, 130, 70, 260);
+  dim(0.3);
+}
+
+function street(scroll) {
+  // dawn sky
+  const g = ctx.createLinearGradient(0, 0, 0, 300);
+  g.addColorStop(0, '#2a3350'); g.addColorStop(1, '#5a5068');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, 300);
+  // low sun
+  ctx.fillStyle = 'rgba(220,170,140,0.5)'; ctx.beginPath(); ctx.arc(160, 250, 40, 0, TWO_PI); ctx.fill();
+  // buildings (parallax)
+  const heights = [180, 240, 150, 300, 210, 260, 170, 230, 200, 280, 160];
+  const spacing = 130;
+  for (let i = -1; i < 9; i++) {
+    const bx = ((i * spacing - scroll * 260) % (spacing * 10) + spacing * 10) % (spacing * 10) - spacing;
+    const h = heights[((i % heights.length) + heights.length) % heights.length];
+    ctx.fillStyle = '#2b3244'; ctx.fillRect(bx, 300 - h, spacing - 16, h);
+    ctx.fillStyle = 'rgba(230,210,150,0.25)';
+    for (let wy = 300 - h + 16; wy < 296; wy += 26)
+      for (let wx = bx + 10; wx < bx + spacing - 30; wx += 22)
+        if (((wx + wy) | 0) % 3 === 0) ctx.fillRect(wx, wy, 8, 12);
+  }
+  // ground
+  ctx.fillStyle = '#232a38'; ctx.fillRect(0, 300, W, H - 300);
+  ctx.fillStyle = '#2f3648'; ctx.fillRect(0, 420, W, H - 420);
+  // sidewalk seams scrolling
+  ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.lineWidth = 2;
+  for (let i = 0; i < 14; i++) {
+    const sx = ((i * 90 - scroll * 260) % (W + 90) + W + 90) % (W + 90) - 45;
+    ctx.beginPath(); ctx.moveTo(sx, 420); ctx.lineTo(sx - 30, H); ctx.stroke();
+  }
+  dim(0.15);
+}
+function briefcase(hand) {
+  ctx.save(); ctx.fillStyle = '#3a2f2a';
+  ctx.fillRect(hand[0] - 11, hand[1] + 2, 22, 16);
+  ctx.strokeStyle = '#5a4a3a'; ctx.lineWidth = 2; ctx.strokeRect(hand[0] - 11, hand[1] + 2, 22, 16);
+  ctx.strokeStyle = '#5a4a3a'; ctx.beginPath(); ctx.arc(hand[0], hand[1] + 2, 6, Math.PI, TWO_PI); ctx.stroke();
+  ctx.restore();
+}
+
+function office(secs) {
+  room('#2f3040', '#26232f', 430);
+  // long window with grey daylight
+  ctx.fillStyle = '#454b5e'; ctx.fillRect(40, 70, 260, 120);
+  ctx.strokeStyle = '#1b2233'; ctx.lineWidth = 4; ctx.strokeRect(40, 70, 260, 120);
+  // wall clock (slow)
+  ctx.save(); ctx.translate(760, 130);
+  ctx.fillStyle = '#d7dbe4'; ctx.beginPath(); ctx.arc(0, 0, 30, 0, TWO_PI); ctx.fill();
+  ctx.strokeStyle = '#20263a'; ctx.lineWidth = 3; ctx.stroke();
+  const m = secs * 0.25; ctx.strokeStyle = '#20263a'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(Math.sin(m) * 20, -Math.cos(m) * 20); ctx.stroke();
+  ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(Math.sin(m * 0.4) * 12, -Math.cos(m * 0.4) * 12); ctx.stroke();
+  ctx.restore();
+  // desk
+  ctx.fillStyle = '#4a4033'; ctx.fillRect(520, 360, 340, 20);
+  ctx.fillStyle = '#3a3226'; ctx.fillRect(540, 380, 14, 90); ctx.fillRect(826, 380, 14, 90);
+  // monitor
+  ctx.fillStyle = '#15181f'; ctx.fillRect(660, 300, 90, 60);
+  const glow = 0.5 + 0.5 * Math.sin(secs * 3);
+  ctx.fillStyle = 'rgba(120,150,200,' + (0.2 + 0.15 * glow) + ')'; ctx.fillRect(666, 306, 78, 48);
+  ctx.fillStyle = '#20242e'; ctx.fillRect(700, 360, 10, 12);
+  // paper stack
+  ctx.fillStyle = '#d7dbe4'; for (let i = 0; i < 4; i++) ctx.fillRect(560 + i, 350 - i * 2, 34, 4);
+  dim(0.2);
+}
+
+function eveningRoad(secs) {
+  const g = ctx.createLinearGradient(0, 0, 0, 300);
+  g.addColorStop(0, '#3a2f3a'); g.addColorStop(1, '#7a5a4a');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, 300);
+  ctx.fillStyle = 'rgba(210,140,110,0.45)'; ctx.beginPath(); ctx.arc(W - 160, 250, 46, 0, TWO_PI); ctx.fill();
+  // distant skyline
+  ctx.fillStyle = '#26202c';
+  for (let i = 0; i < 12; i++) ctx.fillRect(i * 85, 300 - (60 + (i * 53 % 140)), 70, 60 + (i * 53 % 140));
+  // road
+  ctx.fillStyle = '#20222c'; ctx.fillRect(0, 300, W, H - 300);
+  ctx.fillStyle = '#2a2d38'; ctx.fillRect(0, 330, W, H - 330);
+  // cars ahead, stuck (barely creeping)
+  const creep = Math.sin(secs * 0.7) * 4;
+  drawCar(140 + creep, 250, '#3a4358', true, secs);
+  drawCar(360 + creep, 250, '#4a3a3a', true, secs);
+  drawCar(600 + creep, 255, '#3a4a3a', true, secs);
+  dim(0.22);
+}
+function drawCar(x, y, col, tail, secs) {
+  ctx.fillStyle = col; ctx.fillRect(x, y, 120, 34);
+  ctx.fillRect(x + 22, y - 20, 74, 24);
+  ctx.fillStyle = '#8fa0be'; ctx.fillRect(x + 28, y - 15, 62, 16); // windows
+  ctx.fillStyle = '#15171d'; ctx.beginPath(); ctx.arc(x + 26, y + 34, 12, 0, TWO_PI); ctx.arc(x + 94, y + 34, 12, 0, TWO_PI); ctx.fill();
+  if (tail) { ctx.fillStyle = 'rgba(230,70,70,' + (0.6 + 0.4 * Math.sin((secs + x) * 4)) + ')';
+    ctx.fillRect(x - 4, y + 8, 6, 12); }
+}
+
+/* ============================================================================
+   SCENES  — each: draw(st, secs, sceneDur); st in [0,1]
+============================================================================ */
+
+// 1) WAKE UP
+function sWake(st, secs) {
+  const light = lerp(0.12, 0.42, smooth(clamp((st - 0.45) / 0.55, 0, 1)));
+  bedroom(light);
+  alarmClock(505, 350, st < 0.62, secs);
+
+  ctx.save();
+  ctx.translate(285, 360);
+  let rot, mood, blink;
+  const p = { ...BASE };
+  if (st < 0.5) {                         // lying asleep
+    rot = rad(-84);
+    p.lean = Math.sin(secs * 2) * 0.02;   // breathing
+    p.LuA = rad(-4); p.RuA = rad(4); p.LfA = rad(-2); p.RfA = rad(2);
+    p.LuL = rad(-6); p.RuL = rad(10); p.LlL = rad(-16); p.RlL = rad(-4);
+    mood = 'sleep'; blink = 1;
+  } else {                                // sit up groggily
+    const k = ease((st - 0.5) / 0.5);
+    rot = lerp(rad(-84), rad(-6), k);
+    p.RuA = lerp(rad(4), rad(155), k); p.RfA = lerp(rad(2), rad(120), k); // rub eye
+    p.LuA = rad(-8);
+    mood = 'groggy'; blink = 1 - k;
+  }
+  ctx.rotate(rot); ctx.scale(1.15, 1.15);
+  const j = drawFigure(p, OUT.home, mood, { blink });
+  ctx.restore();
+
+  if (st < 0.5) drawZ(320, 320, secs);
+  vignette();
+}
+
+// 2) FRESHEN UP
+function sFreshen(st, secs) {
+  bathroom();
+  faucetDrops(secs);
+  ctx.save();
+  ctx.translate(360, 400); ctx.scale(1.2, 1.2);
+  const p = { ...BASE };
+  p.lean = rad(6);
+  const brush = Math.sin(secs * 14) * 0.25;
+  // right hand up to mouth, brushing
+  p.RuA = rad(150); p.RfA = rad(-72) + brush;
+  p.LuA = rad(-14);
+  p.headTilt = rad(-4) + Math.sin(secs * 3) * 0.03;
+  const tear = st > 0.72 ? smooth((st - 0.72) / 0.28) : 0;
+  const j = drawFigure(p, OUT.bare, 'sad', { towel: true, tear });
+  // toothbrush
+  ctx.fillStyle = '#9fb4d6'; ctx.save(); ctx.translate(j.rhand[0], j.rhand[1]); ctx.rotate(brush);
+  ctx.fillRect(-2, -12, 4, 14); ctx.restore();
+  ctx.restore();
+  vignette();
+}
+
+// 3) SUIT & TIE
+function sSuit(st, secs) {
+  wardrobe();
+  ctx.save();
+  ctx.translate(480, 400); ctx.scale(1.2, 1.2);
+  const p = { ...BASE };
+  let mood = 'tired';
+  if (st < 0.55) {                        // adjust the tie at the neck
+    const wob = Math.sin(secs * 8) * 0.15;
+    p.LuA = rad(140); p.LfA = rad(150) + wob;
+    p.RuA = rad(-140); p.RfA = rad(-150) - wob;
+    p.headTilt = rad(4);
+  } else {                                // shoulders drop — a sigh
+    const k = ease((st - 0.55) / 0.45);
+    p.lean = lerp(0, rad(7), k);
+    p.headTilt = lerp(rad(4), rad(12), k);
+    p.LuA = rad(-9); p.RuA = rad(9);
+  }
+  drawFigure(p, OUT.suit, mood, {});
+  ctx.restore();
+  vignette();
+}
+
+// 4) DRAG TO WORK
+function sDrag(st, secs) {
+  street(st);
+  const hipx = lerp(250, 720, st);
+  const swing = Math.sin(secs * 3.0) * rad(20);
+  const bob = Math.abs(Math.sin(secs * 3.0)) * 4;
+  ctx.save();
+  ctx.translate(hipx, 400 - bob); ctx.scale(1.2, 1.2);
+  const p = { ...BASE };
+  p.lean = rad(15); p.headTilt = rad(12);           // heavy, head down
+  p.LuL = rad(-6) + swing;  p.RuL = rad(6) - swing;
+  p.LlL = p.LuL + rad(-14); p.RlL = p.RuL + rad(-14);
+  p.LuA = rad(-14) - swing * 0.4; p.LfA = rad(-14);
+  p.RuA = rad(16);  p.RfA = rad(18);                // this arm carries the case
+  const j = drawFigure(p, OUT.suit, 'tired', {});
+  briefcase(j.rhand);
+  ctx.restore();
+  vignette();
+}
+
+// 5) SLOUCH AT WORK
+function sWork(st, secs) {
+  office(secs);
+  // slump lower mid-scene, then a head-in-hands beat
+  const slump = smooth(clamp((st - 0.45) / 0.25, 0, 1)) - smooth(clamp((st - 0.75) / 0.25, 0, 1));
+  ctx.save();
+  ctx.translate(690, 372); ctx.scale(1.2, 1.2);
+  const p = { ...BASE };
+  p.lean = rad(30) + slump * rad(16);
+  p.headTilt = rad(18) + slump * rad(14);
+  // seated: thighs forward (screen-left, toward chair front), shins down
+  p.LuL = rad(-95); p.RuL = rad(-92); p.LlL = rad(6); p.RlL = rad(6);
+  // arms reach forward/left to the keyboard, small typing bob
+  const type = Math.sin(secs * 10) * 0.08;
+  p.LuA = rad(-70); p.LfA = rad(-108) + type;
+  p.RuA = rad(-66); p.RfA = rad(-104) - type;
+  drawFigure(p, OUT.suit, 'tired', { blink: 0.3 });
+  ctx.restore();
+  // chair back
+  ctx.fillStyle = '#2a2f3d'; ctx.fillRect(700, 340, 16, 90);
+  vignette();
+}
+
+// 6) TRAFFIC HOME
+function sTraffic(st, secs) {
+  eveningRoad(secs);
+  const bob = Math.sin(secs * 4) * 1.5;
+  // our car
+  ctx.save(); ctx.translate(0, bob);
+  ctx.fillStyle = '#3d4658';
+  ctx.fillRect(300, 330, 240, 70);
+  ctx.fillRect(340, 288, 170, 46);
+  ctx.fillStyle = '#20222c'; ctx.fillRect(346, 292, 120, 40); // window
+  ctx.fillStyle = '#15171d'; ctx.beginPath(); ctx.arc(360, 400, 20, 0, TWO_PI); ctx.arc(500, 400, 20, 0, TWO_PI); ctx.fill();
+  ctx.restore();
+
+  // driver (slumps to wheel around mid)
+  const frust = smooth(clamp((st - 0.4) / 0.2, 0, 1)) - smooth(clamp((st - 0.65) / 0.2, 0, 1));
+  ctx.save();
+  ctx.translate(430, 320 + bob); ctx.scale(1.0, 1.0);
+  const p = { ...BASE };
+  p.lean = rad(20) + frust * rad(22);
+  p.headTilt = rad(10) + frust * rad(22);
+  p.LuL = rad(-95); p.RuL = rad(-92); p.LlL = rad(6); p.RlL = rad(6);
+  p.LuA = rad(-72); p.LfA = rad(-96);
+  p.RuA = rad(-70); p.RfA = rad(-94);
+  drawFigure(p, OUT.suit, 'sad', {});
+  // steering wheel
+  ctx.strokeStyle = '#15171d'; ctx.lineWidth = 5; ctx.beginPath(); ctx.arc(-36, -46, 16, 0, TWO_PI); ctx.stroke();
+  ctx.restore();
+
+  sweat(452, 292 + bob, secs);
+  honk(430, 250, secs);
+  vignette();
+}
+
+// 7) HOME, CHANGE, SLEEP  (ends exactly where sWake begins)
+function sHome(st, secs) {
+  const light = lerp(0.35, 0.08, smooth(clamp(st / 1, 0, 1)));  // room dims toward night
+  bedroom(light);
+  alarmClock(505, 350, false, secs);
+
+  ctx.save();
+  const p = { ...BASE };
+  let outfit = OUT.suit, mood = 'tired', rot = 0, blink = 0, sx = 0, sy = 0, showZ = false;
+
+  if (st < 0.3) {                          // stand, pull off the tie
+    const k = st / 0.3;
+    sx = 640; sy = 400;
+    outfit = OUT.suit;
+    const wob = Math.sin(secs * 9) * 0.2;
+    p.RuA = rad(-140); p.RfA = rad(-150) - wob;
+    p.LuA = rad(-12);
+    p.headTilt = rad(8);
+  } else if (st < 0.6) {                   // trudge to bed
+    const k = (st - 0.3) / 0.3;
+    sx = lerp(640, 300, ease(k)); sy = 400;
+    outfit = OUT.home;
+    const swing = Math.sin(secs * 2.6) * rad(16);
+    p.lean = rad(12); p.headTilt = rad(12);
+    p.LuL = rad(-6) + swing; p.RuL = rad(6) - swing;
+    p.LlL = p.LuL + rad(-12); p.RlL = p.RuL + rad(-12);
+  } else {                                 // lie down and sleep
+    const k = ease((st - 0.6) / 0.4);
+    outfit = OUT.home;
+    rot = lerp(rad(-6), rad(-84), k);
+    sx = lerp(300, 285, k); sy = lerp(400, 360, k);
+    p.lean = Math.sin(secs * 2) * 0.02;
+    p.LuA = rad(-4); p.RuA = rad(4); p.LfA = rad(-2); p.RfA = rad(2);
+    p.LuL = rad(-6); p.RuL = rad(10); p.LlL = rad(-16); p.RlL = rad(-4);
+    mood = k > 0.6 ? 'sleep' : 'tired'; blink = k;
+    showZ = k > 0.7;
+  }
+
+  ctx.translate(sx, sy); ctx.rotate(rot); ctx.scale(1.15, 1.15);
+  drawFigure(p, outfit, mood, { blink });
+  ctx.restore();
+  if (showZ) drawZ(320, 320, secs);
+  vignette();
+}
+
+/* ---- timeline ---- */
+const SCENES = [
+  { name:'6:30 a.m.',       dur:2.6, draw:sWake },
+  { name:'Freshen up',      dur:2.6, draw:sFreshen },
+  { name:'Suit and tie',    dur:2.2, draw:sSuit },
+  { name:'The long walk in',dur:2.6, draw:sDrag },
+  { name:'At the desk',     dur:3.0, draw:sWork },
+  { name:'Traffic home',    dur:2.6, draw:sTraffic },
+  { name:'And again…',      dur:2.4, draw:sHome },
+];
+const DUR = SCENES.reduce((s, x) => s + x.dur, 0);   // ~18s
+const OFF = []; { let a = 0; for (const s of SCENES) { OFF.push(a); a += s.dur; } }
+const FADE = 0.4;   // seconds of black at each scene boundary
+
+function currentSceneIndex(t) {
+  for (let i = SCENES.length - 1; i >= 0; i--) if (t >= OFF[i]) return i;
+  return 0;
+}
+
+function renderFrame(t) {
+  t = ((t % DUR) + DUR) % DUR;
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+
+  const i = currentSceneIndex(t);
+  const local = t - OFF[i];
+  const dur = SCENES[i].dur;
+  SCENES[i].draw(local / dur, local);
+
+  // fade to/from black at boundaries — guarantees a seamless wrap
+  const inA  = clamp((FADE - local) / FADE, 0, 1);
+  const outA = clamp((local - (dur - FADE)) / FADE, 0, 1);
+  const a = Math.max(inA, outA);
+  if (a > 0) { ctx.fillStyle = 'rgba(0,0,0,' + a + ')'; ctx.fillRect(0, 0, W, H); }
+
+  return i;
+}
+
+/* ============================================================================
+   PLAYBACK
+============================================================================ */
+const bar = document.getElementById('bar');
+const label = document.getElementById('scenelabel');
+const statusEl = document.getElementById('status');
+const playBtn = document.getElementById('play');
+const restartBtn = document.getElementById('restart');
+const recBtn = document.getElementById('rec');
+
+let playing = true;
+let baseTime = performance.now();   // performance.now is allowed in page scripts
+let pausedAt = 0;
+let recording = false;
+let recStart = 0;
+
+function loop() {
+  let t;
+  if (recording) {
+    t = (performance.now() - recStart) / 1000;
+    if (t >= DUR) { t = DUR - 0.0001; stopRecording(); }
+  } else if (playing) {
+    t = (performance.now() - baseTime) / 1000;
+  } else {
+    t = pausedAt;
+  }
+  const i = renderFrame(t);
+  label.textContent = SCENES[i].name;
+  bar.style.width = (((t % DUR) / DUR) * 100).toFixed(1) + '%';
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+playBtn.onclick = () => {
+  if (recording) return;
+  if (playing) { pausedAt = ((performance.now() - baseTime) / 1000) % DUR; playing = false; playBtn.textContent = 'Play'; }
+  else { baseTime = performance.now() - pausedAt * 1000; playing = true; playBtn.textContent = 'Pause'; }
+};
+restartBtn.onclick = () => { if (recording) return; baseTime = performance.now(); pausedAt = 0; playing = true; playBtn.textContent = 'Pause'; };
+
+/* ---- MediaRecorder export ---- */
+function pickMime() {
+  const opts = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+  for (const o of opts) if (window.MediaRecorder && MediaRecorder.isTypeSupported(o)) return o;
+  return '';
+}
+let mediaRecorder = null, chunks = [];
+function startRecording() {
+  if (!window.MediaRecorder || !cv.captureStream) {
+    statusEl.textContent = 'This browser can’t export video. Try Chrome, Edge, or Firefox.';
+    return;
+  }
+  const stream = cv.captureStream(FPS);
+  const mime = pickMime();
+  try { mediaRecorder = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 6_000_000 } : {}); }
+  catch (e) { statusEl.textContent = 'Recorder failed to start: ' + e.message; return; }
+  chunks = [];
+  mediaRecorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+  mediaRecorder.onstop = () => {
+    const blob = new Blob(chunks, { type: 'video/webm' });
+    const url = URL.createObjectURL(blob);
+    const a = document.getElementById('dl');
+    a.href = url; a.download = 'the-same-day-again.webm'; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    statusEl.textContent = 'Saved the-same-day-again.webm (' + (blob.size / 1048576).toFixed(1) + ' MB). It loops seamlessly.';
+    recBtn.disabled = false; recBtn.textContent = '● Export video (.webm)';
+    playing = true; baseTime = performance.now(); playBtn.textContent = 'Pause';
+  };
+  recording = true; recStart = performance.now();
+  recBtn.disabled = true; recBtn.textContent = '● Recording one full loop…';
+  statusEl.textContent = 'Recording ' + DUR.toFixed(0) + 's… the animation is running the loop once.';
+  mediaRecorder.start();
+}
+function stopRecording() {
+  recording = false;
+  baseTime = performance.now();   // resync clock now so no frame renders against a stale baseTime
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+}
+recBtn.onclick = () => { if (!recording) startRecording(); };
+
+// keyboard: space toggles play/pause
+window.addEventListener('keydown', e => { if (e.code === 'Space') { e.preventDefault(); playBtn.onclick(); } });
+</script>
+</body>
+</html>
